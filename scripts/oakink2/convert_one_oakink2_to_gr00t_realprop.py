@@ -1,4 +1,3 @@
-cat > scripts/oakink2/convert_one_oakink2_to_gr00t_realprop.py << 'EOF'
 import argparse
 import json
 import pickle
