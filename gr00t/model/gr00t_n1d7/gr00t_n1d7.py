@@ -476,11 +476,19 @@ class Gr00tN1d7ActionHead(nn.Module):
 
     @property
     def device(self):
-        return next(iter(self.parameters())).device
+        for param in self.parameters():
+            return param.device
+        for buffer in self.buffers():
+            return buffer.device
+        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     @property
     def dtype(self):
-        return next(iter(self.parameters())).dtype
+        for param in self.parameters():
+            return param.dtype
+        for buffer in self.buffers():
+            return buffer.dtype
+        return torch.float32
 
     def prepare_input(self, batch: dict) -> BatchFeature:
         """Prepare input batch for the action head."""
@@ -615,11 +623,19 @@ class Gr00tN1d7(PreTrainedModel):
 
     @property
     def device(self):
-        return next(iter(self.parameters())).device
+        for param in self.parameters():
+            return param.device
+        for buffer in self.buffers():
+            return buffer.device
+        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     @property
     def dtype(self):
-        return next(iter(self.parameters())).dtype
+        for param in self.parameters():
+            return param.dtype
+        for buffer in self.buffers():
+            return buffer.dtype
+        return torch.float32
 
 
 # Register the model with HuggingFace
