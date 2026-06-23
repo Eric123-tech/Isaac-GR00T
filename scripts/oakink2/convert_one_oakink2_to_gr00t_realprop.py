@@ -1,3 +1,4 @@
+cat > scripts/oakink2/convert_one_oakink2_to_gr00t_realprop.py << 'EOF'
 import argparse
 import json
 import pickle
@@ -35,6 +36,7 @@ def load_rgb_files(rgb_dir: Path, max_frames: int | None = None):
     files = []
     for ext in IMAGE_EXTS:
         files.extend(rgb_dir.glob(f"*{ext}"))
+
     files = sorted(files, key=natural_key)
 
     if max_frames is not None:
@@ -47,8 +49,12 @@ def load_rgb_files(rgb_dir: Path, max_frames: int | None = None):
 
 
 def get_raw_mano(anno_obj):
+    if not isinstance(anno_obj, dict):
+        raise TypeError(f"Expected annotation object to be dict, got {type(anno_obj)}")
+
     if "raw_mano" not in anno_obj:
         raise KeyError(f"Cannot find 'raw_mano'. Top-level keys: {list(anno_obj.keys())}")
+
     return anno_obj["raw_mano"]
 
 
@@ -70,7 +76,7 @@ def extract_prop_from_mano(frame_mano, mode: str) -> np.ndarray:
     rh_tsl = to_numpy(frame_mano["rh__tsl"]).reshape(3)
 
     if mode == "fingers120":
-        # Drop wrist/global quaternion at index 0.
+        # 15 joints * 4 for each hand. Drop wrist/global quaternion.
         prop = np.concatenate(
             [
                 lh_pose[1:].reshape(-1),
@@ -79,8 +85,20 @@ def extract_prop_from_mano(frame_mano, mode: str) -> np.ndarray:
             axis=0,
         )
 
+    elif mode == "full128":
+        # 16 MANO quaternions * 4 for each hand.
+        # Total dim = 64 + 64 = 128.
+        # This avoids the GR00T N1.7 negative padding issue from 134-dim action.
+        prop = np.concatenate(
+            [
+                lh_pose.reshape(-1),
+                rh_pose.reshape(-1),
+            ],
+            axis=0,
+        )
+
     elif mode == "full134":
-        # Keep full MANO pose and translation for both hands.
+        # Debug only. This may exceed GR00T N1.7 action dimension limit.
         prop = np.concatenate(
             [
                 lh_pose.reshape(-1),
@@ -104,6 +122,7 @@ def build_props_from_rgb(raw_mano, rgb_files, mode: str):
 
     for img_path in rgb_files:
         frame_id = int(img_path.stem)
+
         try:
             frame_mano = get_frame_mano(raw_mano, frame_id)
         except KeyError:
@@ -152,37 +171,30 @@ def write_video(rgb_files, out_path: Path, fps: int, image_size: int):
     return kept
 
 
-def write_parquet(
-    out_path: Path,
-    props: np.ndarray,
-    fps: int,
-    task_index: int = 0,
-    episode_index: int = 0,
-):
+def write_parquet(out_path: Path, props: np.ndarray, fps: int):
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # For row t:
-    #   state[t] = prop[t]
-    #   action[t] = prop[t+1] - prop[t]
+    # state[t] = prop[t]
+    # action[t] = prop[t+1] - prop[t]
     # Therefore rows = T - 1.
     T = props.shape[0]
     num_rows = T - 1
 
     rows = []
     for t in range(num_rows):
-        state = props[t]
-        action = props[t + 1] - props[t]
+        state = props[t].astype(np.float32)
+        action = (props[t + 1] - props[t]).astype(np.float32)
 
         rows.append(
             {
-                "observation.state": state.astype(np.float32).tolist(),
-                "action": action.astype(np.float32).tolist(),
+                "observation.state": state.tolist(),
+                "action": action.tolist(),
                 "timestamp": float(t / fps),
                 "frame_index": int(t),
-                "episode_index": int(episode_index),
+                "episode_index": 0,
                 "index": int(t),
-                "task_index": int(task_index),
-                "annotation.human.action.task_description": int(task_index),
+                "task_index": 0,
+                "annotation.human.action.task_description": 0,
                 "next.reward": 0.0,
                 "next.done": bool(t == num_rows - 1),
             }
@@ -196,12 +208,21 @@ def write_parquet(
 
 def write_jsonl(path: Path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
+
     with path.open("w") as f:
         for row in rows:
             f.write(json.dumps(row) + "\n")
 
 
-def write_meta(output_dir: Path, task: str, num_rows: int, fps: int, image_size: int, prop_dim: int):
+def write_meta(
+    output_dir: Path,
+    task: str,
+    num_rows: int,
+    fps: int,
+    image_size: int,
+    prop_dim: int,
+    robot_type: str,
+):
     meta_dir = output_dir / "meta"
     meta_dir.mkdir(parents=True, exist_ok=True)
 
@@ -228,12 +249,25 @@ def write_meta(output_dir: Path, task: str, num_rows: int, fps: int, image_size:
 
     info = {
         "codebase_version": "v2.0",
-        "robot_type": "oakink2_mano_debug",
+        "robot_type": robot_type,
+
         "total_episodes": 1,
         "total_frames": num_rows,
         "total_tasks": 1,
+        "total_videos": 1,
+        "total_chunks": 1,
+        "chunks_size": 1000,
+
         "fps": fps,
         "video": True,
+
+        "splits": {
+            "train": "0:1",
+        },
+
+        "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+        "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+
         "features": {
             "observation.state": {
                 "dtype": "float32",
@@ -249,6 +283,11 @@ def write_meta(output_dir: Path, task: str, num_rows: int, fps: int, image_size:
                 "dtype": "video",
                 "shape": [image_size, image_size, 3],
                 "names": ["height", "width", "channel"],
+            },
+            "annotation.human.action.task_description": {
+                "dtype": "int64",
+                "shape": [1],
+                "names": ["task_index"],
             },
         },
     }
@@ -285,25 +324,44 @@ def write_meta(output_dir: Path, task: str, num_rows: int, fps: int, image_size:
 
 def main():
     parser = argparse.ArgumentParser()
+
     parser.add_argument("--rgb_dir", required=True)
     parser.add_argument("--anno_pkl", required=True)
     parser.add_argument("--output_dir", required=True)
+
     parser.add_argument("--task", default="Cap the bottle.")
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--max_frames", type=int, default=300)
-    parser.add_argument("--prop_mode", choices=["full134", "fingers120"], default="full134")
+
+    parser.add_argument(
+        "--prop_mode",
+        choices=["full128", "fingers120", "full134"],
+        default="full128",
+    )
+
     args = parser.parse_args()
 
     rgb_dir = Path(args.rgb_dir).expanduser()
     anno_pkl = Path(args.anno_pkl).expanduser()
     output_dir = Path(args.output_dir).expanduser()
 
+    if not rgb_dir.exists() or not rgb_dir.is_dir():
+        raise FileNotFoundError(f"rgb_dir does not exist or is not a directory: {rgb_dir}")
+
+    if not anno_pkl.exists() or not anno_pkl.is_file():
+        raise FileNotFoundError(f"anno_pkl does not exist or is not a file: {anno_pkl}")
+
+    if args.prop_mode == "full134":
+        print("[warn] full134 is for debugging only. It may exceed GR00T N1.7 action dimension limit.")
+
     print(f"[rgb_dir] {rgb_dir}")
     print(f"[anno_pkl] {anno_pkl}")
     print(f"[output_dir] {output_dir}")
+    print(f"[prop_mode] {args.prop_mode}")
 
     rgb_files = load_rgb_files(rgb_dir, max_frames=args.max_frames)
+
     anno_obj = load_pickle(anno_pkl)
     raw_mano = get_raw_mano(anno_obj)
 
@@ -313,7 +371,8 @@ def main():
         mode=args.prop_mode,
     )
 
-    # Match video rows with parquet rows: video uses frames 0..T-2.
+    # Since action[t] = prop[t+1] - prop[t], parquet has T-1 rows.
+    # To keep video frame count equal to parquet row count, use first T-1 images.
     video_rgb_files = valid_rgb_files[:-1]
     parquet_props = props
 
@@ -324,10 +383,17 @@ def main():
     print(f"[first oakink frame id] {oakink_frame_ids[0]}")
     print(f"[last oakink frame id] {oakink_frame_ids[-1]}")
     print(f"[prop shape] {props.shape}")
-    print(f"[prop mode] {args.prop_mode}")
+    print(f"[prop dim] {prop_dim}")
     print(f"[fps] {args.fps}")
 
-    video_path = output_dir / "videos" / "chunk-000" / "observation.images.ego_view" / "episode_000000.mp4"
+    video_path = (
+        output_dir
+        / "videos"
+        / "chunk-000"
+        / "observation.images.ego_view"
+        / "episode_000000.mp4"
+    )
+
     num_video_frames = write_video(
         rgb_files=video_rgb_files,
         out_path=video_path,
@@ -336,6 +402,7 @@ def main():
     )
 
     parquet_path = output_dir / "data" / "chunk-000" / "episode_000000.parquet"
+
     num_rows = write_parquet(
         out_path=parquet_path,
         props=parquet_props,
@@ -352,6 +419,7 @@ def main():
         fps=args.fps,
         image_size=args.image_size,
         prop_dim=prop_dim,
+        robot_type=f"oakink2_mano_{args.prop_mode}",
     )
 
     print("[done]")
