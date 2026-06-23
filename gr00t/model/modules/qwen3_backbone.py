@@ -150,6 +150,7 @@ class Qwen3Backbone(torch.nn.Module):
 
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_name,
+            dtype=torch.bfloat16,
             **extra_kwargs,
             **transformers_loading_kwargs,
         ).eval()
