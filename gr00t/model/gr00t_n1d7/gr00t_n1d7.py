@@ -488,7 +488,7 @@ class Gr00tN1d7ActionHead(nn.Module):
             return param.dtype
         for buffer in self.buffers():
             return buffer.dtype
-        return torch.float32
+        return torch.bfloat16
 
     def prepare_input(self, batch: dict) -> BatchFeature:
         """Prepare input batch for the action head."""
@@ -635,7 +635,7 @@ class Gr00tN1d7(PreTrainedModel):
             return param.dtype
         for buffer in self.buffers():
             return buffer.dtype
-        return torch.float32
+        return torch.bfloat16
 
 
 # Register the model with HuggingFace
