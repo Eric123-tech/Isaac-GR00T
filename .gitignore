@@ -169,3 +169,22 @@ offline_open_loop_eval_plots/
 /models
 /data
 /datasets/
+
+# OakInk2 local data symlink
+datasets/oakink2/
+
+# Large generated data
+*.tar
+*.zip
+*.mp4
+*.parquet
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Training outputs
+outputs/
+gr00t_outputs/
+checkpoints/
+wandb/
