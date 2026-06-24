@@ -121,10 +121,6 @@ The pipeline expects this structure:
 
 ```text
 datasets/oakink2/
-├── raw/
-│   ├── data/
-│   ├── anno_preview/
-│   └── program/
 ├── extracted/
 │   ├── data/
 │   ├── anno_preview/
@@ -167,19 +163,21 @@ datasets/oakink2/extracted/anno_preview/scene_01__A003%2B%2Bseq__49a8305e104d29e
 
 ---
 
-## 3. Manual download and extraction convention
+## 3. Manual extracted layout convention
 
-At the current stage, OakInk2 files are manually downloaded.
+At the current stage, OakInk2 files are manually downloaded and manually extracted outside this pipeline.
+
+The pipeline no longer reads:
+
+```text
+datasets/oakink2/raw/
+```
+
+It also does not auto-extract `.zip`, `.tar`, `.tar.gz`, or `.tgz` files.
 
 ### RGB files
 
-Raw downloaded RGB archives can be stored under:
-
-```text
-datasets/oakink2/raw/data/
-```
-
-After extraction, RGB frames should be placed under:
+RGB frames should be placed directly under:
 
 ```text
 datasets/oakink2/extracted/data/<encoded_key>/<camera>/
@@ -209,13 +207,7 @@ Supported image extensions:
 
 ### Annotation preview files
 
-Raw downloaded annotation archives can be stored under:
-
-```text
-datasets/oakink2/raw/anno_preview/
-```
-
-After extraction or copying, the usable `.pkl` file should be placed under:
+The usable annotation preview `.pkl` file should be placed directly under:
 
 ```text
 datasets/oakink2/extracted/anno_preview/<encoded_key>.pkl
@@ -303,6 +295,125 @@ scripts/oakink2/build_oakink2_manifest.py
 scripts/oakink2/convert_one_oakink2_to_gr00t_realprop.py
 scripts/oakink2/convert_oakink2_manifest_to_gr00t.py
 scripts/oakink2/validate_gr00t_lerobot_dataset.py
+scripts/oakink2/run_oakink2_to_gr00t_pipeline.py
+```
+
+### One-command pipeline
+
+Script:
+
+```text
+scripts/oakink2/run_oakink2_to_gr00t_pipeline.py
+```
+
+Purpose:
+
+```text
+Check the manually extracted layout, generate the manifest, convert to GR00T / LeRobot format, and validate the dataset.
+```
+
+Known one-trajectory command:
+
+```bash
+uv run python scripts/oakink2/run_oakink2_to_gr00t_pipeline.py \
+  --oakink2-root datasets/oakink2 \
+  --task-target-json scripts/oakink2/task_target.json \
+  --camera 104422070969 \
+  --task-key scene_01__A003%2B%2Bseq__49a8305e104d29e3816a__2023-04-15-09-41-56 \
+  --manifest-output datasets/oakink2/manifests/oakink2_available_trajectories.jsonl \
+  --fps 10 \
+  --image-size 256 \
+  --max-frames 300 \
+  --prop-mode full128 \
+  --overwrite
+```
+
+With this `--task-key`, the default output path is:
+
+```text
+datasets/oakink2/gr00t_lerobot/49a83_direct_hand_manifest_1_mano_full128
+```
+
+The `49a83` prefix is taken from the first five characters after `seq__`.
+Pass `--output-dir` explicitly to override this naming rule.
+
+`--task-key` accepts all of these equivalent forms:
+
+```text
+scene_01__A003/seq__49a8305e104d29e3816a__2023-04-15-09-41-56
+scene_01__A003++seq__49a8305e104d29e3816a__2023-04-15-09-41-56
+scene_01__A003%2B%2Bseq__49a8305e104d29e3816a__2023-04-15-09-41-56
+scene_01__A003%2B%2Bseq__49a8305e104d29e3816a__2023-04-15-09-41-56.pkl
+```
+
+Internally these are normalized to the `task_target.json` form:
+
+```text
+scene_01__A003/seq__49a8305e104d29e3816a__2023-04-15-09-41-56
+```
+
+The script always requires these directories to already exist:
+
+```text
+datasets/oakink2/extracted/data
+datasets/oakink2/extracted/anno_preview
+```
+
+The old `--skip-extract` flag is still accepted for command compatibility, but it no longer changes behavior.
+
+Use `--dry-run` to check paths and selected trajectories without writing the manifest or converted dataset:
+
+```bash
+uv run python scripts/oakink2/run_oakink2_to_gr00t_pipeline.py \
+  --task-key scene_01__A003%2B%2Bseq__49a8305e104d29e3816a__2023-04-15-09-41-56 \
+  --dry-run
+```
+
+The one-command script intentionally locks `--prop-mode` to:
+
+```text
+full128
+```
+
+Use the lower-level manifest and converter scripts below for debugging or for experiments with other proprioception definitions.
+
+After a successful one-command run for:
+
+```text
+scene_01__A001%2B%2Bseq__9e46184387ba83f60895__2023-04-27-18-43-58
+```
+
+the script prints the matching upload command:
+
+```bash
+cd ~/linux_projects/Isaac-GR00T
+rsync -avhP --partial datasets/oakink2/gr00t_lerobot/9e461_direct_hand_manifest_1_mano_full128/ david@SERVER_IP:/mnt/data/haoyu_data/oakink2/gr00t_lerobot/9e461_direct_hand_manifest_1_mano_full128/
+```
+
+and the matching server projector-only finetune command:
+
+```bash
+cd ~/Desktop/haoyu/Isaac-GR00T
+rm -rf /mnt/data/haoyu_data/gr00t_outputs/oakink2_9e461_projector_only
+CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+uv run accelerate launch --num_processes 1 --mixed_precision bf16 \
+  gr00t/experiment/launch_finetune.py \
+  --base-model-path nvidia/GR00T-N1.7-3B \
+  --dataset-path datasets/oakink2/gr00t_lerobot/9e461_direct_hand_manifest_1_mano_full128 \
+  --embodiment-tag NEW_EMBODIMENT \
+  --modality-config-path examples/ARTIMANO/oakink2_mano_full134_config.py \
+  --num-gpus 1 \
+  --output-dir /mnt/data/haoyu_data/gr00t_outputs/oakink2_9e461_projector_only \
+  --max-steps 2000 \
+  --save-steps 100 \
+  --global-batch-size 1 \
+  --gradient-accumulation-steps 1 \
+  --dataloader-num-workers 0 \
+  --no-use-wandb \
+  --no-tune-llm \
+  --no-tune-visual \
+  --tune-projector \
+  --no-tune-diffusion-model
 ```
 
 ---
@@ -702,7 +813,7 @@ rsync -avhP --partial \
 
 ### Upload extracted RGB and anno files if server-side conversion is needed
 
-Usually, the server does not need raw/extracted OakInk2 files if the converted GR00T dataset has already been uploaded.
+Usually, the server does not need extracted OakInk2 files if the converted GR00T dataset has already been uploaded.
 
 If the server needs to rebuild the dataset, upload extracted data:
 

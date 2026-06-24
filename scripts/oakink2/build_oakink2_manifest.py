@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import re
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+OAKINK2_KEY_PATTERN = re.compile(r"(scene_[^/]+?)(?:\+\+|/)(seq__[^/]+)")
 
 
 def load_task_targets(path: Path) -> dict:
@@ -23,6 +25,39 @@ def load_task_targets(path: Path) -> dict:
     return data
 
 
+def normalize_oakink2_task_key(key: str) -> str:
+    """
+    Normalize mixed OakInk2 trajectory spellings to the task_target.json form:
+
+        scene_.../seq__...
+
+    Accepted inputs include:
+
+        scene_.../seq__...
+        scene_...++seq__...
+        scene_...%2B%2Bseq__...
+        .../anno_preview/scene_...%2B%2Bseq__....pkl
+        .../data/scene_...++seq__.../<camera>
+    """
+    text = str(key).strip().strip("'\"").replace("\\", "/").rstrip("/")
+    if text.endswith(".pkl"):
+        text = text[:-4]
+
+    decoded = unquote(text).rstrip("/")
+    if decoded.endswith(".pkl"):
+        decoded = decoded[:-4]
+
+    match = OAKINK2_KEY_PATTERN.search(decoded)
+    if match is None:
+        raise ValueError(
+            f"Could not normalize OakInk2 trajectory key {key!r}. "
+            "Expected scene_.../seq__..., scene_...++seq__..., or scene_...%2B%2Bseq__..."
+        )
+
+    scene, seq = match.groups()
+    return f"{scene}/{seq}"
+
+
 def decode_oakink2_key(encoded_key: str) -> tuple[str, str, str]:
     """
     Example:
@@ -36,9 +71,15 @@ def decode_oakink2_key(encoded_key: str) -> tuple[str, str, str]:
         scene_01__A003/seq__49a8305e104d29e3816a__2023-04-15-09-41-56
     """
     decoded_key = unquote(encoded_key)
-    task_key = decoded_key.replace("++", "/")
 
-    if "++" in decoded_key:
+    try:
+        task_key = normalize_oakink2_task_key(encoded_key)
+    except ValueError:
+        task_key = decoded_key.replace("++", "/")
+
+    if "/" in task_key:
+        scene, seq = task_key.split("/", 1)
+    elif "++" in decoded_key:
         scene, seq = decoded_key.split("++", 1)
     else:
         # Fallback for unexpected names.
@@ -57,6 +98,25 @@ def count_rgb_frames(rgb_dir: Path) -> int:
         if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
             count += 1
     return count
+
+
+def anno_pkl_candidates(anno_root: Path, encoded_key: str) -> list[Path]:
+    decoded_key = unquote(encoded_key)
+    candidate_keys = []
+
+    for key in [encoded_key, decoded_key, quote(decoded_key, safe="")]:
+        if key not in candidate_keys:
+            candidate_keys.append(key)
+
+    return [anno_root / f"{key}.pkl" for key in candidate_keys]
+
+
+def resolve_anno_pkl(anno_root: Path, encoded_key: str) -> Path:
+    candidates = anno_pkl_candidates(anno_root, encoded_key)
+    for path in candidates:
+        if path.is_file():
+            return path
+    return candidates[0]
 
 
 def build_manifest(
@@ -91,7 +151,7 @@ def build_manifest(
         decoded_key, task_key, scene, seq = decode_oakink2_key(encoded_key)
 
         rgb_dir = data_root / encoded_key / camera
-        anno_pkl = anno_root / f"{encoded_key}.pkl"
+        anno_pkl = resolve_anno_pkl(anno_root, encoded_key)
 
         has_rgb_dir = rgb_dir.exists() and rgb_dir.is_dir()
         has_anno_pkl = anno_pkl.exists() and anno_pkl.is_file()
