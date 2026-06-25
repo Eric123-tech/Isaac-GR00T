@@ -57,7 +57,9 @@ def write_episode_parquet(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # state[t] = prop[t]
-    # action[t] = prop[t+1] - prop[t]
+    # action[t] = prop[t+1]
+    # GR00T's RELATIVE action processor converts this absolute target to
+    # action[t] - state[t] during training.
     # rows = T - 1
     T = props.shape[0]
     num_rows = T - 1
@@ -67,7 +69,7 @@ def write_episode_parquet(
         rows.append(
             {
                 "observation.state": props[t].astype("float32").tolist(),
-                "action": (props[t + 1] - props[t]).astype("float32").tolist(),
+                "action": props[t + 1].astype("float32").tolist(),
                 "timestamp": float(t / fps),
                 "frame_index": int(t),
                 "episode_index": int(episode_index),

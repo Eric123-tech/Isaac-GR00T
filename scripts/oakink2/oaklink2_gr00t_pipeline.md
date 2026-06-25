@@ -696,8 +696,13 @@ total: 128
 Action:
 
 ```text
-action[t] = observation.state[t + 1] - observation.state[t]
+action[t] = observation.state[t + 1]
 ```
+
+The raw parquet action stores the absolute next-state target. The GR00T
+finetune path uses `ActionRepresentation.RELATIVE`, so its state/action
+processor converts the target to `action[t] - observation.state[t]` during
+training.
 
 Therefore, if `T` matched RGB/MANO frames are used:
 

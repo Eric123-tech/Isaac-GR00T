@@ -174,7 +174,9 @@ def write_parquet(out_path: Path, props: np.ndarray, fps: int):
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # state[t] = prop[t]
-    # action[t] = prop[t+1] - prop[t]
+    # action[t] = prop[t+1]
+    # GR00T's RELATIVE action processor converts this absolute target to
+    # action[t] - state[t] during training.
     # Therefore rows = T - 1.
     T = props.shape[0]
     num_rows = T - 1
@@ -182,7 +184,7 @@ def write_parquet(out_path: Path, props: np.ndarray, fps: int):
     rows = []
     for t in range(num_rows):
         state = props[t].astype(np.float32)
-        action = (props[t + 1] - props[t]).astype(np.float32)
+        action = props[t + 1].astype(np.float32)
 
         rows.append(
             {
@@ -370,7 +372,7 @@ def main():
         mode=args.prop_mode,
     )
 
-    # Since action[t] = prop[t+1] - prop[t], parquet has T-1 rows.
+    # Since action[t] uses prop[t+1] as the absolute target, parquet has T-1 rows.
     # To keep video frame count equal to parquet row count, use first T-1 images.
     video_rgb_files = valid_rgb_files[:-1]
     parquet_props = props
@@ -430,4 +432,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
