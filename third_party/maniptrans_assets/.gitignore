@@ -1,0 +1,7 @@
+# Local copies of ManipTrans assets used for OakInk2 -> Artimano retargeting.
+# These files include SMPL-X model data and mesh assets that should stay local
+# unless their licenses and Git LFS policy are handled explicitly.
+*
+!.gitignore
+!README.md
+
