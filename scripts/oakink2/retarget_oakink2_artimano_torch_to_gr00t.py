@@ -11,18 +11,14 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote
 
+import cv2
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
 
-from build_oakink2_manifest import (
-    load_task_targets,
-    normalize_oakink2_task_key,
-    resolve_anno_pkl,
-)
-from convert_one_oakink2_to_gr00t_realprop import load_rgb_files, write_video
 from retargeting.oakink2_layer.smplx import SMPLXLayer
 
 
@@ -31,12 +27,14 @@ DEFAULT_CAMERA = "104422070969"
 DEFAULT_TASK_TARGET_JSON = Path("scripts/oakink2/task_target.json")
 DEFAULT_ASSET_ROOT = Path("third_party/maniptrans_assets")
 DEFAULT_OUTPUT_ROOT = Path("datasets/oakink2/gr00t_lerobot")
-DEFAULT_SERVER_SSH = "david@137.110.198.188"
+DEFAULT_SERVER_SSH = "david@SERVER_IP"
 DEFAULT_SERVER_REPO_DIR = "~/Desktop/haoyu/Isaac-GR00T"
 DEFAULT_SERVER_DATA_ROOT = "/mnt/data/haoyu_data/oakink2/gr00t_lerobot"
 DEFAULT_SERVER_OUTPUT_ROOT = "/mnt/data/haoyu_data/gr00t_outputs"
 MODALITY_CONFIG_PATH = "examples/ARTIMANO/oakink2_artimano_bimanual_config.py"
 CHUNKS_SIZE = 1000
+IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
+OAKINK2_KEY_PATTERN = re.compile(r"(scene_[^/]+?)(?:\+\+|/)(seq__[^/]+)")
 
 WRIST_POSE_DIM = 9
 
@@ -176,6 +174,102 @@ class SideRetargetResult:
 def read_pickle(path: Path) -> Any:
     with path.expanduser().open("rb") as f:
         return pickle.load(f)
+
+
+def load_task_targets(path: Path) -> dict:
+    path = path.expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"task_target.json not found: {path}")
+
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise TypeError(f"Expected task_target.json to be a dict, but got {type(data)}")
+    return data
+
+
+def normalize_oakink2_task_key(key: str) -> str:
+    """
+    Normalize OakInk2 trajectory spellings to task_target.json form:
+        scene_.../seq__...
+    """
+    text = str(key).strip().strip("'\"").replace("\\", "/").rstrip("/")
+    if text.endswith(".pkl"):
+        text = text[:-4]
+
+    decoded = unquote(text).rstrip("/")
+    if decoded.endswith(".pkl"):
+        decoded = decoded[:-4]
+
+    match = OAKINK2_KEY_PATTERN.search(decoded)
+    if match is None:
+        raise ValueError(
+            f"Could not normalize OakInk2 trajectory key {key!r}. "
+            "Expected scene_.../seq__..., scene_...++seq__..., or scene_...%2B%2Bseq__..."
+        )
+
+    scene, seq = match.groups()
+    return f"{scene}/{seq}"
+
+
+def anno_pkl_candidates(anno_root: Path, encoded_key: str) -> list[Path]:
+    decoded_key = unquote(encoded_key)
+    candidate_keys = []
+    for key in [encoded_key, decoded_key, quote(decoded_key, safe="")]:
+        if key not in candidate_keys:
+            candidate_keys.append(key)
+    return [anno_root / f"{key}.pkl" for key in candidate_keys]
+
+
+def resolve_anno_pkl(anno_root: Path, encoded_key: str) -> Path:
+    candidates = anno_pkl_candidates(anno_root, encoded_key)
+    for path in candidates:
+        if path.is_file():
+            return path
+    return candidates[0]
+
+
+def natural_key(path: Path):
+    stem = path.stem
+    return int(stem) if stem.isdigit() else stem
+
+
+def load_rgb_files(rgb_dir: Path, max_frames: int | None = None) -> list[Path]:
+    files = []
+    for ext in IMAGE_EXTS:
+        files.extend(rgb_dir.glob(f"*{ext}"))
+
+    files = sorted(files, key=natural_key)
+    if max_frames is not None:
+        files = files[:max_frames]
+    if len(files) < 2:
+        raise RuntimeError(f"Need at least 2 images, found {len(files)} in {rgb_dir}")
+    return files
+
+
+def write_video(rgb_files: list[Path], out_path: Path, fps: int, image_size: int) -> int:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    writer = cv2.VideoWriter(
+        str(out_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (image_size, image_size),
+    )
+
+    kept = 0
+    for path in rgb_files:
+        image = cv2.imread(str(path))
+        if image is None:
+            print(f"[warn] failed to read image: {path}")
+            continue
+        image = cv2.resize(image, (image_size, image_size), interpolation=cv2.INTER_AREA)
+        writer.write(image)
+        kept += 1
+
+    writer.release()
+    if kept != len(rgb_files):
+        raise RuntimeError(f"Video wrote {kept} frames, expected {len(rgb_files)}")
+    return kept
 
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -944,51 +1038,62 @@ def print_next_steps(
 ) -> None:
     if args.retarget_only:
         print("[next steps]")
-        print("  --retarget-only was set, so no LeRobot dataset upload/finetune command is printed.")
+        print("  --retarget-only was set, so only the Artimano IK artifact was written.")
         print(f"  retarget_npz: {report['retarget_npz']}")
+        print("  To write a GR00T/LeRobot dataset, rerun this script without --retarget-only.")
         return
 
     dataset_name = output_dir.name
     server_dataset_path = f"{args.server_data_root.rstrip('/')}/{dataset_name}"
-    train_output_name = args.train_output_name or f"oakink2_{inputs.short_id}_artimano_torch_projector_only"
+    train_output_name = args.train_output_name or f"oakink2_{inputs.short_id}_artimano_torch_projector_diffusion_2gpu"
     server_output_dir = f"{args.server_output_root.rstrip('/')}/{train_output_name}"
 
     print("\n[next steps]")
-    print("# 1) Upload generated LeRobot dataset")
+    print("# Note")
+    print("# Do not run scripts/oakink2/run_oakink2_to_gr00t_pipeline.py for this Artimano flow.")
+    print("# That older pipeline writes MANO prop vectors; this script already did:")
+    print("# extracted OakInk2 -> SMPL-X/MANO FK -> Artimano IK -> GR00T/LeRobot dataset.")
+
+    print("\n# 1) Validate the generated LeRobot dataset locally")
+    print("cd ~/linux_projects/Isaac-GR00T")
+    print("uv run python scripts/oakink2/validate_gr00t_lerobot_dataset.py \\")
+    print(f"  --dataset_dir {output_dir}")
+
+    print("\n# 2) Upload generated LeRobot dataset")
     print("cd ~/linux_projects/Isaac-GR00T")
     print("rsync -avhP --partial \\")
     print(f"  {output_dir}/ \\")
     print(f"  {args.server_ssh}:{server_dataset_path}/")
 
-    print("\n# 2) Upload the GR00T modality config and retargeting code")
+    print("\n# 3) Upload the GR00T modality config and retargeting code")
     print("rsync -avhP --relative \\")
     print(f"  {MODALITY_CONFIG_PATH} \\")
     print("  scripts/oakink2/retarget_oakink2_artimano_torch_to_gr00t.py \\")
     print("  scripts/oakink2/retargeting/ \\")
     print(f"  {args.server_ssh}:{args.server_repo_dir}/")
 
-    print("\n# 3) On the server, finetune GR00T")
+    print("\n# 4) On the server, finetune GR00T")
     print(f"cd {args.server_repo_dir}")
     print(f"rm -rf {server_output_dir}")
-    print("CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\")
-    print("uv run accelerate launch --num_processes 1 --mixed_precision bf16 \\")
+    print("CUDA_VISIBLE_DEVICES=0,1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\")
+    print("uv run torchrun --nproc_per_node=2 --master_port=29500 \\")
     print("  gr00t/experiment/launch_finetune.py \\")
     print("  --base-model-path nvidia/GR00T-N1.7-3B \\")
     print(f"  --dataset-path {server_dataset_path} \\")
     print("  --embodiment-tag NEW_EMBODIMENT \\")
     print(f"  --modality-config-path {MODALITY_CONFIG_PATH} \\")
-    print("  --num-gpus 1 \\")
+    print("  --num-gpus 2 \\")
     print(f"  --output-dir {server_output_dir} \\")
     print("  --max-steps 2000 \\")
     print("  --save-steps 100 \\")
-    print("  --global-batch-size 1 \\")
+    print("  --global-batch-size 2 \\")
     print("  --gradient-accumulation-steps 1 \\")
     print("  --dataloader-num-workers 0 \\")
     print("  --no-use-wandb \\")
     print("  --no-tune-llm \\")
     print("  --no-tune-visual \\")
     print("  --tune-projector \\")
-    print("  --no-tune-diffusion-model")
+    print("  --tune-diffusion-model")
 
 
 def convert_one(args: argparse.Namespace) -> None:
@@ -1080,6 +1185,7 @@ def convert_one(args: argparse.Namespace) -> None:
     parquet_path = output_dir / "data" / "chunk-000" / "episode_000000.parquet"
 
     if not args.retarget_only:
+        print("[lerobot] writing video/parquet/meta")
         num_video_frames = write_video(
             rgb_files=valid_rgb_files[:-1],
             out_path=video_path,
