@@ -1,0 +1,511 @@
+From 4013eb4c2f8eb27c6c653d5d5bff48505f34fa47 Mon Sep 17 00:00:00 2001
+From: Eric123-tech <e8899027@gmail.com>
+Date: Fri, 26 Jun 2026 14:29:17 -0700
+Subject: [PATCH] add Artimano USD load and GR00T drive tests
+
+---
+ .../gr00t_bridge/test_gr00t_drive_artimano.py | 201 +++++++++++++
+ .../gr00t_bridge/test_load_artimano_usd.py    | 283 ++++++++++++++++++
+ 2 files changed, 484 insertions(+)
+ create mode 100644 scripts/gr00t_bridge/test_gr00t_drive_artimano.py
+ create mode 100644 scripts/gr00t_bridge/test_load_artimano_usd.py
+
+diff --git a/scripts/gr00t_bridge/test_gr00t_drive_artimano.py b/scripts/gr00t_bridge/test_gr00t_drive_artimano.py
+new file mode 100644
+index 0000000000..830ff50d5d
+--- /dev/null
++++ b/scripts/gr00t_bridge/test_gr00t_drive_artimano.py
+@@ -0,0 +1,201 @@
++import time
++import numpy as np
++import torch
++
++from isaaclab.app import AppLauncher
++
++app_launcher = AppLauncher(headless=True)
++simulation_app = app_launcher.app
++
++import isaaclab.sim as sim_utils
++from isaaclab.assets import Articulation, ArticulationCfg
++from isaaclab.actuators import ImplicitActuatorCfg
++
++from lightweight_gr00t_client import LightweightGR00TClient
++
++
++LH_USD = "/mnt/data/haoyu_data/isaaclab_assets/artimano/lh_mano.usd"
++RH_USD = "/mnt/data/haoyu_data/isaaclab_assets/artimano/rh_mano.usd"
++
++MT_ORDER = [
++    "j_index1y", "j_index1z", "j_index2", "j_index3",
++    "j_middle1y", "j_middle1z", "j_middle2", "j_middle3",
++    "j_pinky1y", "j_pinky1z", "j_pinky2", "j_pinky3",
++    "j_ring1y", "j_ring1z", "j_ring2", "j_ring3",
++    "j_thumb1x", "j_thumb1y", "j_thumb1z",
++    "j_thumb2y", "j_thumb2z", "j_thumb3",
++]
++
++ISAACLAB_ORDER = [
++    "j_index1y", "j_middle1y", "j_pinky1y", "j_ring1y", "j_thumb1x",
++    "j_index1z", "j_middle1z", "j_pinky1z", "j_ring1z", "j_thumb1y",
++    "j_index2", "j_middle2", "j_pinky2", "j_ring2", "j_thumb1z",
++    "j_index3", "j_middle3", "j_pinky3", "j_ring3",
++    "j_thumb2y", "j_thumb2z", "j_thumb3",
++]
++
++MT_TO_ISAACLAB = [MT_ORDER.index(name) for name in ISAACLAB_ORDER]
++ISAACLAB_TO_MT = [ISAACLAB_ORDER.index(name) for name in MT_ORDER]
++
++
++def make_hand_cfg(prim_path: str, usd_path: str, pos) -> ArticulationCfg:
++    return ArticulationCfg(
++        prim_path=prim_path,
++        spawn=sim_utils.UsdFileCfg(
++            usd_path=usd_path,
++            rigid_props=sim_utils.RigidBodyPropertiesCfg(
++                disable_gravity=True,
++                retain_accelerations=False,
++                linear_damping=0.05,
++                angular_damping=0.05,
++                max_linear_velocity=1000.0,
++                max_angular_velocity=1000.0,
++                max_depenetration_velocity=1.0,
++            ),
++            articulation_props=sim_utils.ArticulationRootPropertiesCfg(
++                enabled_self_collisions=False,
++                solver_position_iteration_count=8,
++                solver_velocity_iteration_count=0,
++            ),
++        ),
++        init_state=ArticulationCfg.InitialStateCfg(
++            pos=pos,
++            rot=(1.0, 0.0, 0.0, 0.0),
++        ),
++        actuators={
++            "all_joints": ImplicitActuatorCfg(
++                joint_names_expr=[".*"],
++                stiffness=5.0,
++                damping=0.1,
++            ),
++        },
++    )
++
++
++def runtime_to_mt(q_runtime: torch.Tensor) -> torch.Tensor:
++    return q_runtime[ISAACLAB_TO_MT]
++
++
++def mt_to_runtime(q_mt: torch.Tensor) -> torch.Tensor:
++    return q_mt[MT_TO_ISAACLAB]
++
++
++def build_obs(lh: Articulation, rh: Articulation):
++    # IsaacLab runtime order -> ManipTrans / GR00T order
++    lh_runtime = lh.data.joint_pos[0].detach().cpu()
++    rh_runtime = rh.data.joint_pos[0].detach().cpu()
++
++    lh_mt = runtime_to_mt(lh_runtime).numpy().astype(np.float32)
++    rh_mt = runtime_to_mt(rh_runtime).numpy().astype(np.float32)
++
++    # 暂时固定 wrist pose：xyz + rot6d
++    left_wrist = np.array([0, 0, 0, 1, 0, 0, 0, 1, 0], dtype=np.float32)
++    right_wrist = np.array([0, 0, 0, 1, 0, 0, 0, 1, 0], dtype=np.float32)
++
++    # 先用 fake image 验证闭环。后面再接 IsaacLab camera。
++    rgb = np.zeros((256, 256, 3), dtype=np.uint8)
++
++    return {
++        "video": {
++            "ego_view": rgb[None, None, ...],
++        },
++        "state": {
++            "left_wrist_pose": left_wrist[None, None, :],
++            "right_wrist_pose": right_wrist[None, None, :],
++            "left_hand_qpos": lh_mt[None, None, :],
++            "right_hand_qpos": rh_mt[None, None, :],
++        },
++        "language": {
++            "annotation.human.action.task_description": [["pick up the object"]],
++        },
++    }
++
++
++def apply_gr00t_delta(robot: Articulation, delta_mt_np: np.ndarray):
++    # delta_mt_np: shape (22,), ManipTrans / GR00T order
++    device = robot.data.joint_pos.device
++
++    cur_runtime = robot.data.joint_pos[0]
++    cur_mt = runtime_to_mt(cur_runtime)
++
++    delta_mt = torch.tensor(delta_mt_np, dtype=torch.float32, device=device)
++
++    limits_runtime = robot.data.soft_joint_pos_limits[0]
++    limits_mt = limits_runtime[ISAACLAB_TO_MT]
++
++    # GR00T action 是 RELATIVE，所以当前 qpos + delta
++    cmd_mt = cur_mt + delta_mt
++    cmd_mt = torch.clamp(cmd_mt, limits_mt[:, 0], limits_mt[:, 1])
++
++    cmd_runtime = mt_to_runtime(cmd_mt)
++    robot.set_joint_position_target(cmd_runtime.unsqueeze(0))
++
++
++def main():
++    sim_cfg = sim_utils.SimulationCfg(dt=1.0 / 60.0, device="cuda:0")
++    sim = sim_utils.SimulationContext(sim_cfg)
++    sim.set_camera_view([1.2, 1.2, 1.2], [0.0, 0.0, 0.8])
++
++    ground_cfg = sim_utils.GroundPlaneCfg()
++    ground_cfg.func("/World/defaultGroundPlane", ground_cfg)
++
++    light_cfg = sim_utils.DomeLightCfg(intensity=1000.0)
++    light_cfg.func("/World/Light", light_cfg)
++
++    lh = Articulation(make_hand_cfg("/World/LH", LH_USD, (-0.2, 0.0, 1.0)))
++    rh = Articulation(make_hand_cfg("/World/RH", RH_USD, (0.2, 0.0, 1.0)))
++
++    sim.reset()
++    print("[INFO] Simulation reset complete.")
++
++    lh.update(sim.get_physics_dt())
++    rh.update(sim.get_physics_dt())
++
++    assert lh.joint_names == ISAACLAB_ORDER, lh.joint_names
++    assert rh.joint_names == ISAACLAB_ORDER, rh.joint_names
++    print("[INFO] IsaacLab joint order verified.")
++
++    client = LightweightGR00TClient(host="localhost", port=5555, timeout_ms=30000)
++    print("ping:", client.ping())
++    client.reset()
++
++    for step in range(10):
++        t0 = time.time()
++
++        obs = build_obs(lh, rh)
++        action, info = client.get_action(obs)
++
++        # 只取 horizon 的第 0 帧 action
++        lh_delta_mt = np.asarray(action["left_hand_qpos"], dtype=np.float32)[0, 0]
++        rh_delta_mt = np.asarray(action["right_hand_qpos"], dtype=np.float32)[0, 0]
++
++        apply_gr00t_delta(lh, lh_delta_mt)
++        apply_gr00t_delta(rh, rh_delta_mt)
++
++        lh.write_data_to_sim()
++        rh.write_data_to_sim()
++
++        for _ in range(5):
++            sim.step()
++            lh.update(sim.get_physics_dt())
++            rh.update(sim.get_physics_dt())
++
++        lh_q_mt = runtime_to_mt(lh.data.joint_pos[0]).detach().cpu().numpy()
++        rh_q_mt = runtime_to_mt(rh.data.joint_pos[0]).detach().cpu().numpy()
++
++        print(
++            f"step={step:02d} "
++            f"lh_delta=({lh_delta_mt.min():.4f},{lh_delta_mt.max():.4f}) "
++            f"rh_delta=({rh_delta_mt.min():.4f},{rh_delta_mt.max():.4f}) "
++            f"lh_q=({lh_q_mt.min():.4f},{lh_q_mt.max():.4f}) "
++            f"rh_q=({rh_q_mt.min():.4f},{rh_q_mt.max():.4f}) "
++            f"dt={time.time() - t0:.3f}s"
++        )
++
++    client.close()
++    print("[INFO] GR00T -> Artimano IsaacLab drive test OK.")
++    simulation_app.close()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/gr00t_bridge/test_load_artimano_usd.py b/scripts/gr00t_bridge/test_load_artimano_usd.py
+new file mode 100644
+index 0000000000..43c8606773
+--- /dev/null
++++ b/scripts/gr00t_bridge/test_load_artimano_usd.py
+@@ -0,0 +1,283 @@
++
++from isaaclab.app import AppLauncher
++
++
++
++app_launcher = AppLauncher(headless=True)
++
++simulation_app = app_launcher.app
++
++
++
++import torch
++
++
++
++import isaaclab.sim as sim_utils
++
++from isaaclab.assets import Articulation, ArticulationCfg
++
++from isaaclab.actuators import ImplicitActuatorCfg
++
++
++
++
++
++LH_USD = "/mnt/data/haoyu_data/isaaclab_assets/artimano/lh_mano.usd"
++
++RH_USD = "/mnt/data/haoyu_data/isaaclab_assets/artimano/rh_mano.usd"
++
++
++
++
++
++EXPECTED_ORDER = [
++
++    "j_index1y",
++
++    "j_index1z",
++
++    "j_index2",
++
++    "j_index3",
++
++    "j_middle1y",
++
++    "j_middle1z",
++
++    "j_middle2",
++
++    "j_middle3",
++
++    "j_pinky1y",
++
++    "j_pinky1z",
++
++    "j_pinky2",
++
++    "j_pinky3",
++
++    "j_ring1y",
++
++    "j_ring1z",
++
++    "j_ring2",
++
++    "j_ring3",
++
++    "j_thumb1x",
++
++    "j_thumb1y",
++
++    "j_thumb1z",
++
++    "j_thumb2y",
++
++    "j_thumb2z",
++
++    "j_thumb3",
++
++]
++
++
++
++
++
++def make_hand_cfg(prim_path: str, usd_path: str) -> ArticulationCfg:
++
++    return ArticulationCfg(
++
++        prim_path=prim_path,
++
++        spawn=sim_utils.UsdFileCfg(
++
++            usd_path=usd_path,
++
++            rigid_props=sim_utils.RigidBodyPropertiesCfg(
++
++                disable_gravity=True,
++
++                retain_accelerations=False,
++
++                linear_damping=0.05,
++
++                angular_damping=0.05,
++
++                max_linear_velocity=1000.0,
++
++                max_angular_velocity=1000.0,
++
++                max_depenetration_velocity=1.0,
++
++            ),
++
++            articulation_props=sim_utils.ArticulationRootPropertiesCfg(
++
++                enabled_self_collisions=False,
++
++                solver_position_iteration_count=8,
++
++                solver_velocity_iteration_count=0,
++
++            ),
++
++        ),
++
++        init_state=ArticulationCfg.InitialStateCfg(
++
++            pos=(0.0, 0.0, 1.0),
++
++            rot=(1.0, 0.0, 0.0, 0.0),
++
++        ),
++
++        actuators={
++
++            "all_joints": ImplicitActuatorCfg(
++
++                joint_names_expr=[".*"],
++
++                stiffness=5.0,
++
++                damping=0.1,
++
++            ),
++
++        },
++
++    )
++
++
++
++
++
++def print_robot_info(name: str, robot: Articulation):
++
++    print(f"\n===== {name} =====")
++
++    print("num_joints:", robot.num_joints)
++
++    print("joint_names:")
++
++    for i, n in enumerate(robot.joint_names):
++
++        print(f"{i:02d}: {n}")
++
++
++
++    print("\nsoft_joint_pos_limits shape:", tuple(robot.data.soft_joint_pos_limits.shape))
++
++    limits = robot.data.soft_joint_pos_limits[0].detach().cpu()
++
++    for i, n in enumerate(robot.joint_names):
++
++        lo, hi = limits[i].tolist()
++
++        print(f"{i:02d}: {n:12s} lower={lo:.6f} upper={hi:.6f}")
++
++
++
++    if robot.joint_names == EXPECTED_ORDER:
++
++        print("ORDER_CHECK: MATCH")
++
++    else:
++
++        print("ORDER_CHECK: MISMATCH")
++
++        print("expected:")
++
++        for i, n in enumerate(EXPECTED_ORDER):
++
++            print(f"{i:02d}: {n}")
++
++
++
++
++
++def main():
++
++    sim_cfg = sim_utils.SimulationCfg(dt=1.0 / 60.0, device="cuda:0")
++
++    sim = sim_utils.SimulationContext(sim_cfg)
++
++    sim.set_camera_view([1.5, 1.5, 1.5], [0.0, 0.0, 0.7])
++
++
++
++    ground_cfg = sim_utils.GroundPlaneCfg()
++
++    ground_cfg.func("/World/defaultGroundPlane", ground_cfg)
++
++
++
++    light_cfg = sim_utils.DomeLightCfg(intensity=1000.0)
++
++    light_cfg.func("/World/Light", light_cfg)
++
++
++
++    lh = Articulation(make_hand_cfg("/World/LH", LH_USD))
++
++    rh_cfg = make_hand_cfg("/World/RH", RH_USD)
++
++    rh_cfg.init_state.pos = (0.3, 0.0, 1.0)
++
++    rh = Articulation(rh_cfg)
++
++
++
++    sim.reset()
++
++    print("[INFO] Simulation reset complete.")
++
++
++
++    lh.update(sim.get_physics_dt())
++
++    rh.update(sim.get_physics_dt())
++
++
++
++    print_robot_info("LH", lh)
++
++    print_robot_info("RH", rh)
++
++
++
++    # Try one safe position target: middle of joint limits.
++
++    for robot in [lh, rh]:
++
++        limits = robot.data.soft_joint_pos_limits[0]
++
++        target = 0.5 * (limits[:, 0] + limits[:, 1])
++
++        robot.set_joint_position_target(target.unsqueeze(0))
++
++        robot.write_data_to_sim()
++
++
++
++    for _ in range(20):
++
++        sim.step()
++
++        lh.update(sim.get_physics_dt())
++
++        rh.update(sim.get_physics_dt())
++
++
++
++    print("\n[INFO] Artimano USD load + joint target test OK.")
++
++    simulation_app.close()
++
++
++
++
++
++if __name__ == "__main__":
++
++    main()
++
+-- 
+2.34.1
+
