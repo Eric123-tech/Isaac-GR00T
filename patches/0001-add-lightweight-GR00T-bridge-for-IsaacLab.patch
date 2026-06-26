@@ -1,0 +1,193 @@
+From 91555f2b327b3814d026c1ad7923adf2c2b0c2ae Mon Sep 17 00:00:00 2001
+From: Eric123-tech <e8899027@gmail.com>
+Date: Fri, 26 Jun 2026 11:19:31 -0700
+Subject: [PATCH] add lightweight GR00T bridge for IsaacLab
+
+---
+ .../gr00t_bridge/lightweight_gr00t_client.py  | 94 +++++++++++++++++++
+ .../test_gr00t_in_isaaclab_loop.py            | 72 ++++++++++++++
+ 2 files changed, 166 insertions(+)
+ create mode 100644 scripts/gr00t_bridge/lightweight_gr00t_client.py
+ create mode 100644 scripts/gr00t_bridge/test_gr00t_in_isaaclab_loop.py
+
+diff --git a/scripts/gr00t_bridge/lightweight_gr00t_client.py b/scripts/gr00t_bridge/lightweight_gr00t_client.py
+new file mode 100644
+index 0000000000..5344254d5a
+--- /dev/null
++++ b/scripts/gr00t_bridge/lightweight_gr00t_client.py
+@@ -0,0 +1,94 @@
++import functools
++from typing import Any
++
++import msgpack
++import msgpack_numpy as mnp
++import numpy as np
++import zmq
++
++
++class MsgSerializer:
++    @staticmethod
++    def to_bytes(data: Any) -> bytes:
++        default = functools.partial(MsgSerializer._safe_encode)
++        return msgpack.packb(data, default=default)
++
++    @staticmethod
++    def from_bytes(data: bytes) -> Any:
++        object_hook = functools.partial(MsgSerializer._safe_decode)
++        return msgpack.unpackb(data, object_hook=object_hook, raw=False)
++
++    @staticmethod
++    def _safe_encode(obj):
++        if isinstance(obj, np.ndarray) and obj.dtype.kind == "O":
++            raise TypeError(f"Refusing to encode object-dtype ndarray: shape={obj.shape}")
++        return mnp.encode(obj)
++
++    @staticmethod
++    def _safe_decode(obj):
++        # Decode numpy arrays.
++        obj = mnp.decode(obj)
++
++        # Decode GR00T ModalityConfig into plain json dict.
++        if isinstance(obj, dict) and ("__ModalityConfig__" in obj or b"__ModalityConfig__" in obj):
++            return obj.get("as_json", obj.get(b"as_json"))
++
++        return obj
++
++
++class LightweightGR00TClient:
++    def __init__(self, host="localhost", port=5555, timeout_ms=15000, api_token=None):
++        self.host = host
++        self.port = port
++        self.timeout_ms = timeout_ms
++        self.api_token = api_token
++        self.context = zmq.Context()
++        self._init_socket()
++
++    def _init_socket(self):
++        self.socket = self.context.socket(zmq.REQ)
++        self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
++        self.socket.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
++        self.socket.connect(f"tcp://{self.host}:{self.port}")
++
++    def call_endpoint(self, endpoint, data=None, requires_input=True):
++        request = {"endpoint": endpoint}
++        if requires_input:
++            request["data"] = data
++        if self.api_token:
++            request["api_token"] = self.api_token
++
++        try:
++            self.socket.send(MsgSerializer.to_bytes(request))
++            message = self.socket.recv()
++        except zmq.error.Again:
++            self._init_socket()
++            raise
++
++        response = MsgSerializer.from_bytes(message)
++
++        if isinstance(response, dict) and "error" in response:
++            raise RuntimeError(f"Server error: {response['error']}")
++
++        return response
++
++    def ping(self):
++        self.call_endpoint("ping", requires_input=False)
++        return True
++
++    def reset(self, options=None):
++        return self.call_endpoint("reset", {"options": options})
++
++    def get_modality_config(self):
++        return self.call_endpoint("get_modality_config", requires_input=False)
++
++    def get_action(self, observation, options=None):
++        response = self.call_endpoint(
++            "get_action",
++            {"observation": observation, "options": options},
++        )
++        return tuple(response)
++
++    def close(self):
++        self.socket.close(linger=0)
++        self.context.term()
+diff --git a/scripts/gr00t_bridge/test_gr00t_in_isaaclab_loop.py b/scripts/gr00t_bridge/test_gr00t_in_isaaclab_loop.py
+new file mode 100644
+index 0000000000..4d04423b3b
+--- /dev/null
++++ b/scripts/gr00t_bridge/test_gr00t_in_isaaclab_loop.py
+@@ -0,0 +1,72 @@
++import time
++import numpy as np
++
++# Isaac Sim app must be created before most Isaac imports.
++from isaacsim import SimulationApp
++
++simulation_app = SimulationApp({"headless": True})
++
++from lightweight_gr00t_client import LightweightGR00TClient
++
++
++def make_fake_obs():
++    left_wrist = np.array([0, 0, 0, 1, 0, 0, 0, 1, 0], dtype=np.float32)
++    right_wrist = np.array([0, 0, 0, 1, 0, 0, 0, 1, 0], dtype=np.float32)
++    left_qpos = np.zeros(22, dtype=np.float32)
++    right_qpos = np.zeros(22, dtype=np.float32)
++    rgb = np.zeros((256, 256, 3), dtype=np.uint8)
++
++    return {
++        "video": {
++            "ego_view": rgb[None, None, ...],
++        },
++        "state": {
++            "left_wrist_pose": left_wrist[None, None, :],
++            "right_wrist_pose": right_wrist[None, None, :],
++            "left_hand_qpos": left_qpos[None, None, :],
++            "right_hand_qpos": right_qpos[None, None, :],
++        },
++        "language": {
++            "annotation.human.action.task_description": [["pick up the object"]],
++        },
++    }
++
++
++def main():
++    client = LightweightGR00TClient(
++        host="localhost",
++        port=5555,
++        timeout_ms=30000,
++    )
++
++    print("ping:", client.ping())
++    client.reset()
++
++    for step in range(5):
++        t0 = time.time()
++
++        # Step Isaac Sim once.
++        simulation_app.update()
++
++        # Query GR00T once.
++        obs = make_fake_obs()
++        action, info = client.get_action(obs)
++
++        left_hand = np.asarray(action["left_hand_qpos"])
++        right_hand = np.asarray(action["right_hand_qpos"])
++
++        print(
++            f"step={step} "
++            f"left_hand_shape={left_hand.shape} "
++            f"right_hand_shape={right_hand.shape} "
++            f"left_minmax=({left_hand.min():.4f},{left_hand.max():.4f}) "
++            f"dt={time.time() - t0:.3f}s"
++        )
++
++    client.close()
++    simulation_app.close()
++    print("IsaacLab loop + GR00T client test OK")
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.34.1
+
