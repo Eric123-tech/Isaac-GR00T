@@ -1043,9 +1043,15 @@ def print_next_steps(
         print("  To write a GR00T/LeRobot dataset, rerun this script without --retarget-only.")
         return
 
-    dataset_name = output_dir.name
-    server_dataset_path = f"{args.server_data_root.rstrip('/')}/{dataset_name}"
-    train_output_name = args.train_output_name or f"oakink2_{inputs.short_id}_artimano_torch_projector_diffusion_2gpu"
+    rendered_relstats_dataset = (
+        f"{args.server_data_root.rstrip('/')}/{inputs.short_id}_artimano_torch_wrist_qpos_"
+        "isaac_render_rgb_row68_window_relstats_recomputed"
+    )
+    train_output_name = (
+        args.train_output_name
+        or f"oakink2_{inputs.short_id}_artimano_torch_isaac_render_rgb_row68_"
+        "from_base_relstats_recomputed_projector_diffusion_2gpu"
+    )
     server_output_dir = f"{args.server_output_root.rstrip('/')}/{train_output_name}"
 
     print("\n[next steps]")
@@ -1054,38 +1060,42 @@ def print_next_steps(
     print("# That older pipeline writes MANO prop vectors; this script already did:")
     print("# extracted OakInk2 -> SMPL-X/MANO FK -> Artimano IK -> GR00T/LeRobot dataset.")
 
-    print("\n# 1) Validate the generated LeRobot dataset locally")
-    print("cd ~/linux_projects/Isaac-GR00T")
+    print("\n# 1) Validate the generated LeRobot dataset on this server")
+    print("cd /home/david/Desktop/haoyu/Isaac-GR00T")
     print("uv run python scripts/oakink2/validate_gr00t_lerobot_dataset.py \\")
     print(f"  --dataset_dir {output_dir}")
 
-    print("\n# 2) Upload generated LeRobot dataset")
-    print("cd ~/linux_projects/Isaac-GR00T")
-    print("rsync -avhP --partial \\")
-    print(f"  {output_dir}/ \\")
-    print(f"  {args.server_ssh}:{server_dataset_path}/")
+    print("\n# 2) IsaacLab GT demo / visual sanity check")
+    print("conda activate env_isaaclab")
+    print("cd /home/david/IsaacLab")
+    print("OMNI_KIT_ACCEPT_EULA=YES CUDA_VISIBLE_DEVICES=0 \\")
+    print("./isaaclab.sh -p scripts/gr00t_bridge/replay_lerobot_gt_artimano_oakink_scene_with_object_gt_ego_view_video.py")
 
-    print("\n# 3) Upload the GR00T modality config and retargeting code")
-    print("rsync -avhP --relative \\")
-    print(f"  {MODALITY_CONFIG_PATH} \\")
-    print("  scripts/oakink2/retarget_oakink2_artimano_torch_to_gr00t.py \\")
-    print("  scripts/oakink2/retargeting/ \\")
-    print(f"  {args.server_ssh}:{args.server_repo_dir}/")
+    print("\n# 3) Full IsaacLab-side orchestrator")
+    print("cd /home/david/IsaacLab")
+    print("python scripts/gr00t_bridge/oakink2_artimano_pipeline/run_oakink2_artimano_pipeline.py \\")
+    print("  --config scripts/gr00t_bridge/oakink2_artimano_pipeline/configs/fccd8.json \\")
+    print("  --run-render-rgb \\")
+    print("  --run-package-rendered-rgb \\")
+    print("  --run-recompute-relative-stats \\")
+    print("  --run-finetune \\")
+    print("  --overwrite")
 
-    print("\n# 4) On the server, finetune GR00T")
-    print(f"cd {args.server_repo_dir}")
-    print(f"rm -rf {server_output_dir}")
+    print("\n# 4) Direct GR00T finetune command")
+    print("cd /home/david/Desktop/haoyu/Isaac-GR00T")
+    print("export HF_HOME=/mnt/data/haoyu_data/hf_cache")
+    print("export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
     print("CUDA_VISIBLE_DEVICES=0,1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\")
-    print("uv run torchrun --nproc_per_node=2 --master_port=29500 \\")
+    print("uv run torchrun --nproc_per_node=2 --master_port=29502 \\")
     print("  gr00t/experiment/launch_finetune.py \\")
     print("  --base-model-path nvidia/GR00T-N1.7-3B \\")
-    print(f"  --dataset-path {server_dataset_path} \\")
+    print(f"  --dataset-path {rendered_relstats_dataset} \\")
     print("  --embodiment-tag NEW_EMBODIMENT \\")
     print(f"  --modality-config-path {MODALITY_CONFIG_PATH} \\")
     print("  --num-gpus 2 \\")
     print(f"  --output-dir {server_output_dir} \\")
-    print("  --max-steps 2000 \\")
-    print("  --save-steps 100 \\")
+    print("  --max-steps 4000 \\")
+    print("  --save-steps 500 \\")
     print("  --global-batch-size 2 \\")
     print("  --gradient-accumulation-steps 1 \\")
     print("  --dataloader-num-workers 0 \\")
