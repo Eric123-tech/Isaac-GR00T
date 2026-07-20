@@ -157,6 +157,16 @@ class FinetuneConfig:
     num_shards_per_epoch: int = int(1e5)
     """Number of shards to use for the dataset. reduce this number if vram is limited."""
 
+    allow_padding: bool = True
+    """If True, clamp out-of-range temporal indices to episode boundaries.
+    Required when a modality config uses negative observation history such as
+    video delta_indices=[-20, 0]."""
+
+    use_percentiles: bool = False
+    """If True, use q01/q99 bounds for min-max normalization. If False, use
+    full min/max statistics. Absolute joint targets that must round-trip
+    exactly should use the default False value."""
+
     save_only_model: bool = False
     """If True, save only model weights (skip optimizer/scheduler/RNG states). Cannot resume training from these checkpoints."""
 
