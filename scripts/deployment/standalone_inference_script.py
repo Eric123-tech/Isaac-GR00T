@@ -351,7 +351,14 @@ def prepare_observation_data(
         Parsed observation ready for inference
     """
     # Extract step data from trajectory
-    data_point = extract_step_data(traj, step_count, modality_configs, embodiment_tag)
+    # Match training-time boundary behavior for history frames such as [-20, 0].
+    data_point = extract_step_data(
+        traj,
+        step_count,
+        modality_configs,
+        embodiment_tag,
+        allow_padding=True,
+    )
 
     # Build observation dictionary
     obs = {}
@@ -680,6 +687,9 @@ def main(args: ArgsConfig):
         model_path=local_model_path,
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
+    if hasattr(policy.model, "num_inference_timesteps"):
+        policy.model.num_inference_timesteps = args.denoising_steps
+        logging.info(f"Using {args.denoising_steps} denoising steps")
 
     # Apply inference mode
     if args.inference_mode == "trt_full_pipeline":

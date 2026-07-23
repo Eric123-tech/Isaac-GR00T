@@ -17,6 +17,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 import logging
 from pathlib import Path
+import random
 import re
 from typing import Any
 import warnings
@@ -42,6 +43,18 @@ NOTE: provide --model_path to load up the model checkpoint in this script,
         else it will use the default host and port via RobotInferenceClient
 
 """
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    except ImportError:
+        pass
 
 
 def plot_trajectory_results(
@@ -180,7 +193,14 @@ def evaluate_single_trajectory(
     modality_configs = deepcopy(loader.modality_configs)
     modality_configs.pop("action")
     for step_count in range(0, actual_steps, action_horizon):
-        data_point = extract_step_data(traj, step_count, modality_configs, embodiment_tag)
+        # Match training-time boundary behavior for history frames such as [-20, 0].
+        data_point = extract_step_data(
+            traj,
+            step_count,
+            modality_configs,
+            embodiment_tag,
+            allow_padding=True,
+        )
         logging.info(f"inferencing at step: {step_count}")
         obs = {}
         for k, v in data_point.states.items():
@@ -276,6 +296,9 @@ class ArgsConfig:
     denoising_steps: int = 4
     """Number of denoising steps to use."""
 
+    seed: int = 42
+    """Seed to use for reproducible PyTorch open-loop inference."""
+
     save_plot_path: str | None = None
     """Path to save the plot to."""
 
@@ -287,6 +310,8 @@ def main(args: ArgsConfig):
     args.embodiment_tag = EmbodimentTag.resolve(args.embodiment_tag)
     # Set up logging
     logging.basicConfig(level=logging.INFO)
+    set_seed(args.seed)
+    logging.info(f"Using seed {args.seed}")
 
     # Download model checkpoint if it's an S3 path
     local_model_path = args.model_path
@@ -315,12 +340,22 @@ def main(args: ArgsConfig):
             model_path=local_model_path,
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
+        if hasattr(policy.model, "num_inference_timesteps"):
+            policy.model.num_inference_timesteps = args.denoising_steps
+            logging.info(f"Using {args.denoising_steps} denoising steps")
     else:
         policy = PolicyClient(host=args.host, port=args.port)
 
     # Get the supported modalities for the policy
     modality = policy.get_modality_config()
     logging.info(f"Current modality config: \n{modality}")
+    model_action_horizon = len(modality["action"].delta_indices)
+    if args.action_horizon != model_action_horizon:
+        logging.warning(
+            f"--action-horizon {args.action_horizon} differs from checkpoint action horizon "
+            f"{model_action_horizon}; only the first {args.action_horizon} steps of each "
+            "predicted chunk will be plotted before the next inference call."
+        )
 
     # Create the dataset
     dataset = LeRobotEpisodeLoader(
